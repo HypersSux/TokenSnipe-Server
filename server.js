@@ -60,18 +60,62 @@ if (DISCORD_TOKEN && DISCORD_GUILD && DISCORD_ROLE) {
     new SlashCommandBuilder()
       .setName('revokekey')
       .setDescription('Revoke a TokenSnipe license key')
-      .addStringOption(o => o.setName('key').setDescription('The key to revoke e.g. ET-XXXXXXXXXXXXXXXX').setRequired(true)),
+      .addStringOption(o => o.setName('key').setDescription('The key to revoke').setRequired(true)),
+    new SlashCommandBuilder()
+      .setName('reactivate')
+      .setDescription('Reactivate a revoked key')
+      .addStringOption(o => o.setName('key').setDescription('The key to reactivate').setRequired(true)),
     new SlashCommandBuilder()
       .setName('keyinfo')
-      .setDescription('Look up info on a license key')
+      .setDescription('Look up info and live countdown on a license key')
       .addStringOption(o => o.setName('key').setDescription('The key to look up').setRequired(true)),
     new SlashCommandBuilder()
       .setName('resetwid')
-      .setDescription('Reset the HWID lock on a key')
+      .setDescription('Reset the HWID lock on a key so it can be used on a new device')
       .addStringOption(o => o.setName('key').setDescription('The key to reset').setRequired(true)),
     new SlashCommandBuilder()
+      .setName('deletekey')
+      .setDescription('Permanently delete a key')
+      .addStringOption(o => o.setName('key').setDescription('The key to delete').setRequired(true)),
+    new SlashCommandBuilder()
+      .setName('extendkey')
+      .setDescription('Extend the duration of an existing key')
+      .addStringOption(o => o.setName('key').setDescription('The key to extend').setRequired(true))
+      .addStringOption(o => o
+        .setName('duration')
+        .setDescription('How much time to add')
+        .setRequired(true)
+        .addChoices(
+          { name: '1 hour',    value: 'h1'  }, { name: '6 hours',   value: 'h6'  },
+          { name: '12 hours',  value: 'h12' }, { name: '1 day',     value: 'd1'  },
+          { name: '3 days',    value: 'd3'  }, { name: '7 days',    value: 'd7'  },
+          { name: '14 days',   value: 'd14' }, { name: '30 days',   value: 'd30' },
+          { name: '1 month',   value: 'm1'  }, { name: '3 months',  value: 'm3'  },
+          { name: '6 months',  value: 'm6'  }, { name: '12 months', value: 'm12' },
+        )
+      ),
+    new SlashCommandBuilder()
       .setName('listkeys')
-      .setDescription('List all active keys'),
+      .setDescription('List keys by filter')
+      .addStringOption(o => o
+        .setName('filter')
+        .setDescription('Which keys to show')
+        .setRequired(false)
+        .addChoices(
+          { name: 'Active',   value: 'active'  },
+          { name: 'Pending (not activated yet)', value: 'pending' },
+          { name: 'Revoked',  value: 'revoked' },
+          { name: 'Expired',  value: 'expired' },
+          { name: 'All',      value: 'all'     },
+        )
+      ),
+    new SlashCommandBuilder()
+      .setName('listnotes')
+      .setDescription('Search keys by note or key string')
+      .addStringOption(o => o.setName('search').setDescription('Search term').setRequired(false)),
+    new SlashCommandBuilder()
+      .setName('stats')
+      .setDescription('Show TokenSnipe key statistics'),
   ].map(c => c.toJSON());
 
   client.once('clientReady', async () => {
@@ -106,26 +150,16 @@ if (DISCORD_TOKEN && DISCORD_GUILD && DISCORD_ROLE) {
       const duration = interaction.options.getString('duration') || 'lifetime';
       const key      = 'ET-' + crypto.randomBytes(8).toString('hex').toUpperCase();
       const keys     = loadKeys();
-
-      // Parse duration — h# = hours, d# = days, m# = months, lifetime = null
-      let expiresAt = null;
-      let durationLabel = 'Lifetime';
-      if (duration !== 'lifetime') {
-        const type = duration[0];
-        const num  = parseInt(duration.slice(1));
-        let ms = 0;
-        if (type === 'h') { ms = num * 3600000;       durationLabel = num + ' hour' + (num > 1 ? 's' : ''); }
-        if (type === 'd') { ms = num * 86400000;       durationLabel = num + ' day'  + (num > 1 ? 's' : ''); }
-        if (type === 'm') { ms = num * 30 * 86400000;  durationLabel = num + ' month'+ (num > 1 ? 's' : ''); }
-        expiresAt = new Date(Date.now() + ms).toISOString();
-      }
+      const { label: durationLabel, isLifetime } = parseDuration(duration);
 
       keys[key] = {
         active: true,
         created: new Date().toISOString(),
         note,
         duration: durationLabel,
-        expiresAt,
+        pendingDuration: isLifetime ? null : duration,
+        expiresAt: null,
+        firstActivated: null,
         activations: 0,
         hwid: null,
         lastUsed: null,
@@ -140,7 +174,7 @@ if (DISCORD_TOKEN && DISCORD_GUILD && DISCORD_ROLE) {
           { name: 'Key', value: '`' + key + '`', inline: false },
           { name: 'Duration', value: durationLabel, inline: true },
           { name: 'Note', value: note || 'None', inline: true },
-          { name: 'Expires', value: expiresAt ? new Date(expiresAt).toLocaleString() : 'Never', inline: true }
+          { name: 'Timer starts', value: isLifetime ? 'N/A — Lifetime' : 'On first login', inline: true }
         )
         .setFooter({ text: 'Generated by ' + interaction.user.tag })
         .setTimestamp();
@@ -155,14 +189,28 @@ if (DISCORD_TOKEN && DISCORD_GUILD && DISCORD_ROLE) {
       if (!keys[key]) return interaction.reply({ content: 'Key not found: `' + key + '`', ephemeral: true });
       keys[key].active = false;
       saveKeys(keys);
-
       const embed = new EmbedBuilder()
         .setColor(0xef4444)
         .setTitle('Key Revoked')
         .setDescription('`' + key + '` has been revoked. The user will be kicked within 5 minutes.')
         .setFooter({ text: 'Revoked by ' + interaction.user.tag })
         .setTimestamp();
+      return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
 
+    // ── /reactivate ──────────────────────────────────────────────────────
+    if (commandName === 'reactivate') {
+      const key  = interaction.options.getString('key').toUpperCase();
+      const keys = loadKeys();
+      if (!keys[key]) return interaction.reply({ content: 'Key not found: `' + key + '`', ephemeral: true });
+      keys[key].active = true;
+      saveKeys(keys);
+      const embed = new EmbedBuilder()
+        .setColor(0x10b981)
+        .setTitle('Key Reactivated')
+        .setDescription('`' + key + '` is now active again.')
+        .setFooter({ text: 'Reactivated by ' + interaction.user.tag })
+        .setTimestamp();
       return interaction.reply({ embeds: [embed], ephemeral: true });
     }
 
@@ -174,21 +222,49 @@ if (DISCORD_TOKEN && DISCORD_GUILD && DISCORD_ROLE) {
       if (!entry) return interaction.reply({ content: 'Key not found: `' + key + '`', ephemeral: true });
 
       const now    = new Date();
-      const status = !entry.active ? 'Revoked' : (entry.expiresAt && new Date(entry.expiresAt) <= now) ? 'Expired' : 'Active';
-      const color  = status === 'Active' ? 0x10b981 : 0xef4444;
+      const isPending = !entry.firstActivated && entry.pendingDuration;
+      const isExpired = entry.expiresAt && new Date(entry.expiresAt) <= now;
+      const status = !entry.active ? '🔴 Revoked' : isPending ? '⏳ Not activated yet' : isExpired ? '💀 Expired' : '🟢 Active';
+      const color  = !entry.active ? 0xef4444 : isPending ? 0xf59e0b : isExpired ? 0x6b7280 : 0x10b981;
+
+      // Use Discord's native <t:unix:R> for live countdown
+      let expiryField = 'Never (Lifetime)';
+      if (isPending) {
+        expiryField = 'Starts on first login\nDuration: ' + entry.duration;
+      } else if (entry.expiresAt) {
+        const unixTs = Math.floor(new Date(entry.expiresAt).getTime() / 1000);
+        expiryField = '<t:' + unixTs + ':F>\n⏱️ <t:' + unixTs + ':R>';
+      }
+
+      let activatedField = 'Never activated';
+      if (entry.firstActivated) {
+        const unixAct = Math.floor(new Date(entry.firstActivated).getTime() / 1000);
+        activatedField = '<t:' + unixAct + ':F>';
+      }
+
+      let lastUsedField = 'Never';
+      if (entry.lastUsed) {
+        const unixUsed = Math.floor(new Date(entry.lastUsed).getTime() / 1000);
+        lastUsedField = '<t:' + unixUsed + ':R>';
+      }
+
+      const createdUnix = Math.floor(new Date(entry.created).getTime() / 1000);
 
       const embed = new EmbedBuilder()
         .setColor(color)
-        .setTitle('Key Info: ' + key)
+        .setTitle('Key Info')
+        .setDescription('`' + key + '`')
         .addFields(
           { name: 'Status', value: status, inline: true },
-          { name: 'Note', value: entry.note || 'None', inline: true },
-          { name: 'HWID', value: entry.hwid ? 'Locked' : 'Free', inline: true },
-          { name: 'Expires', value: entry.expiresAt ? new Date(entry.expiresAt).toLocaleDateString() : 'Never', inline: true },
+          { name: 'HWID', value: entry.hwid ? '🔒 Locked' : '🔓 Free', inline: true },
           { name: 'Uses', value: String(entry.activations || 0), inline: true },
-          { name: 'Last Used', value: entry.lastUsed ? new Date(entry.lastUsed).toLocaleDateString() : 'Never', inline: true },
-          { name: 'Created', value: new Date(entry.created).toLocaleDateString(), inline: true },
+          { name: 'Note', value: entry.note || 'None', inline: true },
+          { name: 'Duration', value: entry.duration || 'Lifetime', inline: true },
           { name: 'Created By', value: entry.createdBy || 'Dashboard', inline: true },
+          { name: 'Expiry / Time Left', value: expiryField, inline: false },
+          { name: 'First Activated', value: activatedField, inline: true },
+          { name: 'Last Used', value: lastUsedField, inline: true },
+          { name: 'Created', value: '<t:' + createdUnix + ':D>', inline: true },
         )
         .setTimestamp();
 
@@ -200,39 +276,133 @@ if (DISCORD_TOKEN && DISCORD_GUILD && DISCORD_ROLE) {
       const key  = interaction.options.getString('key').toUpperCase();
       const keys = loadKeys();
       if (!keys[key]) return interaction.reply({ content: 'Key not found: `' + key + '`', ephemeral: true });
-      keys[key].hwid      = null;
-      keys[key].lockedAt  = null;
+      keys[key].hwid = null; keys[key].lockedAt = null;
       saveKeys(keys);
-
       const embed = new EmbedBuilder()
         .setColor(0xa78bfa)
         .setTitle('HWID Reset')
-        .setDescription('`' + key + '` is now unlocked and can be activated on a new device.')
+        .setDescription('`' + key + '` is now unlocked and can be used on a new device.')
         .setFooter({ text: 'Reset by ' + interaction.user.tag })
         .setTimestamp();
+      return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
 
+    // ── /deletekey ───────────────────────────────────────────────────────
+    if (commandName === 'deletekey') {
+      const key  = interaction.options.getString('key').toUpperCase();
+      const keys = loadKeys();
+      if (!keys[key]) return interaction.reply({ content: 'Key not found: `' + key + '`', ephemeral: true });
+      delete keys[key];
+      saveKeys(keys);
+      const embed = new EmbedBuilder()
+        .setColor(0xef4444)
+        .setTitle('Key Deleted')
+        .setDescription('`' + key + '` has been permanently deleted.')
+        .setFooter({ text: 'Deleted by ' + interaction.user.tag })
+        .setTimestamp();
+      return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    // ── /extendkey ───────────────────────────────────────────────────────
+    if (commandName === 'extendkey') {
+      const key      = interaction.options.getString('key').toUpperCase();
+      const duration = interaction.options.getString('duration');
+      const keys     = loadKeys();
+      const entry    = keys[key];
+      if (!entry) return interaction.reply({ content: 'Key not found: `' + key + '`', ephemeral: true });
+      const { ms, label } = parseDuration(duration);
+      if (ms === 0) return interaction.reply({ content: 'Invalid duration.', ephemeral: true });
+      // Extend from now if expired/not set, otherwise extend from current expiry
+      const base = (entry.expiresAt && new Date(entry.expiresAt) > new Date()) ? new Date(entry.expiresAt) : new Date();
+      entry.expiresAt = new Date(base.getTime() + ms).toISOString();
+      entry.duration  = (entry.duration || '') + ' +' + label;
+      saveKeys(keys);
+      const unixTs = Math.floor(new Date(entry.expiresAt).getTime() / 1000);
+      const embed = new EmbedBuilder()
+        .setColor(0x10b981)
+        .setTitle('Key Extended')
+        .addFields(
+          { name: 'Key', value: '`' + key + '`', inline: false },
+          { name: 'Extended by', value: label, inline: true },
+          { name: 'New expiry', value: '<t:' + unixTs + ':F>\n⏱️ <t:' + unixTs + ':R>', inline: true },
+        )
+        .setFooter({ text: 'Extended by ' + interaction.user.tag })
+        .setTimestamp();
+      return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    // ── /listnotes ───────────────────────────────────────────────────────
+    if (commandName === 'listnotes') {
+      const query = (interaction.options.getString('search') || '').toLowerCase();
+      const keys  = loadKeys();
+      const matches = Object.entries(keys).filter(([k, v]) =>
+        (!query || (v.note||'').toLowerCase().includes(query) || k.toLowerCase().includes(query))
+      );
+      if (!matches.length) return interaction.reply({ content: 'No keys found.', ephemeral: true });
+      const now = new Date();
+      const lines = matches.slice(0, 25).map(([k, v]) => {
+        const isPending = !v.firstActivated && v.pendingDuration;
+        const status = !v.active ? '🔴' : isPending ? '⏳' : (v.expiresAt && new Date(v.expiresAt) <= now) ? '💀' : '🟢';
+        const exp = isPending ? 'not activated' : v.expiresAt ? '<t:' + Math.floor(new Date(v.expiresAt).getTime()/1000) + ':R>' : 'lifetime';
+        return status + ' `' + k + '` — ' + (v.note || 'no note') + ' — ' + exp;
+      });
+      const embed = new EmbedBuilder()
+        .setColor(0x3b82f6)
+        .setTitle('Keys' + (query ? ' matching "' + query + '"' : '') + ' (' + matches.length + ')')
+        .setDescription(lines.join('\n') + (matches.length > 25 ? '\n...and ' + (matches.length-25) + ' more' : ''))
+        .setTimestamp();
       return interaction.reply({ embeds: [embed], ephemeral: true });
     }
 
     // ── /listkeys ────────────────────────────────────────────────────────
     if (commandName === 'listkeys') {
+      const filter = interaction.options.getString('filter') || 'active';
       const keys   = loadKeys();
       const now    = new Date();
-      const active = Object.entries(keys).filter(([, v]) => v.active && (!v.expiresAt || new Date(v.expiresAt) > now));
-
-      if (!active.length) return interaction.reply({ content: 'No active keys found.', ephemeral: true });
-
-      const lines = active.slice(0, 20).map(([k, v]) => {
-        const exp = v.expiresAt ? new Date(v.expiresAt).toLocaleDateString() : 'Lifetime';
-        return '`' + k + '` — ' + (v.note || 'No note') + ' — ' + exp;
+      let entries  = Object.entries(keys);
+      if (filter === 'active')   entries = entries.filter(([,v]) => v.active && (!v.expiresAt || new Date(v.expiresAt) > now));
+      if (filter === 'revoked')  entries = entries.filter(([,v]) => !v.active);
+      if (filter === 'expired')  entries = entries.filter(([,v]) => v.active && v.expiresAt && new Date(v.expiresAt) <= now);
+      if (filter === 'pending')  entries = entries.filter(([,v]) => v.active && !v.firstActivated && v.pendingDuration);
+      if (!entries.length) return interaction.reply({ content: 'No ' + filter + ' keys found.', ephemeral: true });
+      const lines = entries.slice(0,20).map(([k,v]) => {
+        const isPending = !v.firstActivated && v.pendingDuration;
+        const exp = isPending ? '⏳ not activated' : v.expiresAt ? '<t:'+Math.floor(new Date(v.expiresAt).getTime()/1000)+':R>' : '∞ lifetime';
+        return '`' + k + '` — ' + (v.note||'no note') + ' — ' + exp;
       });
-
       const embed = new EmbedBuilder()
         .setColor(0x3b82f6)
-        .setTitle('Active Keys (' + active.length + ')')
-        .setDescription(lines.join('\n') + (active.length > 20 ? '\n...and ' + (active.length - 20) + ' more' : ''))
+        .setTitle(filter.charAt(0).toUpperCase()+filter.slice(1)+' Keys ('+entries.length+')')
+        .setDescription(lines.join('\n') + (entries.length>20 ? '\n...and '+(entries.length-20)+' more' : ''))
         .setTimestamp();
+      return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
 
+    // ── /stats ───────────────────────────────────────────────────────────
+    if (commandName === 'stats') {
+      const keys  = loadKeys();
+      const vals  = Object.values(keys);
+      const now   = new Date();
+      const total    = vals.length;
+      const active   = vals.filter(v => v.active && (!v.expiresAt || new Date(v.expiresAt) > now) && v.firstActivated).length;
+      const pending  = vals.filter(v => v.active && !v.firstActivated && v.pendingDuration).length;
+      const revoked  = vals.filter(v => !v.active).length;
+      const expired  = vals.filter(v => v.active && v.expiresAt && new Date(v.expiresAt) <= now).length;
+      const lifetime = vals.filter(v => v.active && !v.expiresAt && !v.pendingDuration).length;
+      const totalUses = vals.reduce((a,v) => a+(v.activations||0), 0);
+      const embed = new EmbedBuilder()
+        .setColor(0x3b82f6)
+        .setTitle('TokenSnipe Stats')
+        .addFields(
+          { name: '🟢 Active',    value: String(active),   inline: true },
+          { name: '⏳ Pending',   value: String(pending),  inline: true },
+          { name: '🔴 Revoked',   value: String(revoked),  inline: true },
+          { name: '💀 Expired',   value: String(expired),  inline: true },
+          { name: '∞ Lifetime',   value: String(lifetime), inline: true },
+          { name: '📦 Total Keys',value: String(total),    inline: true },
+          { name: '🔑 Total Activations', value: String(totalUses), inline: true },
+        )
+        .setTimestamp();
       return interaction.reply({ embeds: [embed], ephemeral: true });
     }
   });
@@ -328,9 +498,29 @@ app.post('/validate', (req, res) => {
   const keys  = loadKeys();
   const entry = keys[key];
   if (!entry || !entry.active) return res.json({ valid: false, error: 'Invalid or revoked key' });
-  if (entry.expiresAt && new Date() > new Date(entry.expiresAt)) return res.json({ valid: false, error: 'Key has expired' });
+
+  // ── TIMER STARTS ON FIRST LOGIN ──────────────────────────────────────────
+  // If key has never been activated, start the countdown NOW from first login
+  if (!entry.firstActivated && entry.pendingDuration) {
+    const dur = entry.pendingDuration;
+    const type = dur[0], num = parseInt(dur.slice(1));
+    let ms = 0;
+    if (type === 'h') ms = num * 3600000;
+    if (type === 'd') ms = num * 86400000;
+    if (type === 'm') ms = num * 30 * 86400000;
+    if (ms > 0) {
+      entry.expiresAt = new Date(Date.now() + ms).toISOString();
+    }
+    entry.firstActivated = new Date().toISOString();
+    delete entry.pendingDuration;
+  }
+
+  if (entry.expiresAt && new Date() > new Date(entry.expiresAt))
+    return res.json({ valid: false, error: 'Key has expired' });
+
   if (!entry.hwid) { entry.hwid = hwid; entry.lockedAt = new Date().toISOString(); }
   else if (entry.hwid !== hwid) return res.json({ valid: false, error: 'Key is locked to another device' });
+
   entry.lastUsed    = new Date().toISOString();
   entry.activations = (entry.activations || 0) + 1;
   saveKeys(keys);
@@ -404,28 +594,39 @@ app.post('/admin/keys/delete', requirePanel, (req, res) => {
 
 // ── ADMIN API — superadmin AND panel users ────────────────────────────────
 
+// Helper: parse duration string into ms and label
+function parseDuration(duration) {
+  if (!duration || duration === 'lifetime') return { ms: 0, label: 'Lifetime', isLifetime: true };
+  const type = duration[0], num = parseInt(duration.slice(1));
+  let ms = 0, label = '';
+  if (type === 'h' && !isNaN(num)) { ms = num * 3600000;           label = num + ' hour'  + (num > 1 ? 's' : ''); }
+  else if (type === 'd' && !isNaN(num)) { ms = num * 86400000;     label = num + ' day'   + (num > 1 ? 's' : ''); }
+  else if (type === 'm' && !isNaN(num)) { ms = num * 30*86400000;  label = num + ' month' + (num > 1 ? 's' : ''); }
+  else if (!isNaN(parseInt(duration))) { ms = parseInt(duration)*86400000; label = duration + ' days'; }
+  return { ms, label, isLifetime: false };
+}
+
 app.post('/admin/keys/create', requirePanel, (req, res) => {
   const { note, duration } = req.body;
   const key  = 'ET-' + crypto.randomBytes(8).toString('hex').toUpperCase();
   const keys = loadKeys();
+  const { ms, label, isLifetime } = parseDuration(duration);
 
-  // Parse duration — supports: h1-h23, d1-d30, m1-m12, lifetime, or legacy numeric days
-  let expiresAt = null;
-  let durationLabel = 'Lifetime';
-  if (duration && duration !== 'lifetime') {
-    const type = duration[0];
-    const num  = parseInt(duration.slice(1));
-    let ms = 0;
-    if (type === 'h' && !isNaN(num)) { ms = num * 3600000;      durationLabel = num + ' hour'  + (num > 1 ? 's' : ''); }
-    else if (type === 'd' && !isNaN(num)) { ms = num * 86400000; durationLabel = num + ' day'   + (num > 1 ? 's' : ''); }
-    else if (type === 'm' && !isNaN(num)) { ms = num * 30 * 86400000; durationLabel = num + ' month' + (num > 1 ? 's' : ''); }
-    else if (!isNaN(parseInt(duration))) { ms = parseInt(duration) * 86400000; durationLabel = duration + ' days'; } // legacy
-    if (ms > 0) expiresAt = new Date(Date.now() + ms).toISOString();
-  }
-
-  keys[key] = { active: true, created: new Date().toISOString(), note: note || '', duration: durationLabel, expiresAt, activations: 0, hwid: null, lastUsed: null };
+  keys[key] = {
+    active: true,
+    created: new Date().toISOString(),
+    note: note || '',
+    duration: label,
+    // Timer starts on FIRST LOGIN — store as pending, don't set expiresAt yet
+    pendingDuration: isLifetime ? null : duration,
+    expiresAt: null,
+    firstActivated: null,
+    activations: 0,
+    hwid: null,
+    lastUsed: null,
+  };
   saveKeys(keys);
-  res.json({ key, expiresAt, duration: durationLabel });
+  res.json({ key, duration: label, startsOnLogin: !isLifetime });
 });
 
 // Panel user management — superadmin only
@@ -790,11 +991,18 @@ function setFilter(mode,el){ filterMode=mode; document.querySelectorAll('.ftab')
 function getStatus(k){ const now=new Date(); if(!k.active)return'revoked'; if(k.expiresAt&&new Date(k.expiresAt)<=now)return'expired'; return'active'; }
 
 function fmtExpiry(k){
-  if(!k.expiresAt)return'<span class="expiry-never">Lifetime</span>';
-  const now=new Date(),exp=new Date(k.expiresAt),diff=exp-now,days=Math.ceil(diff/86400000),str=exp.toLocaleDateString();
-  if(diff<=0)return'<span class="expiry-exp">'+str+' (expired)</span>';
-  if(days<=3)return'<span class="expiry-soon">'+str+' ('+days+'d left)</span>';
-  return'<span class="expiry-ok">'+str+'</span>';
+  if(k.pendingDuration&&!k.firstActivated)return'<span class="expiry-never" title="Timer starts on first login">⏳ Starts on login ('+esc(k.duration||'')+')</span>';
+  if(!k.expiresAt)return'<span class="expiry-never">&#8734; Lifetime</span>';
+  const now=new Date(),exp=new Date(k.expiresAt),diff=exp-now;
+  const dateStr=exp.toLocaleDateString()+' '+exp.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+  if(diff<=0)return'<span class="expiry-exp">Expired '+dateStr+'</span>';
+  const days=Math.floor(diff/86400000),hrs=Math.floor((diff%86400000)/3600000),mins=Math.floor((diff%3600000)/60000),secs=Math.floor((diff%60000)/1000);
+  let countStr='';
+  if(days>0) countStr=days+'d '+hrs+'h '+mins+'m';
+  else if(hrs>0) countStr=hrs+'h '+mins+'m '+secs+'s';
+  else countStr=mins+'m '+secs+'s';
+  const cls=days<=0&&hrs<1?'expiry-exp':days<=3?'expiry-soon':'expiry-ok';
+  return'<span class="'+cls+'" title="Expires: '+dateStr+'">'+countStr+' left<br><small style="opacity:.6;font-size:10px">'+dateStr+'</small></span>';
 }
 
 function fmtDate(d){ if(!d)return'<span style="color:var(--t3)">Never</span>'; return new Date(d).toLocaleDateString()+' '+new Date(d).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}); }
@@ -933,6 +1141,8 @@ function toast(msg,type='ok'){
 }
 
 setInterval(()=>{ if(adminKey||panelToken) fetchKeys(isSuperAdmin); },30000);
+// Live countdown — re-render table every second to update timers
+setInterval(()=>{ if((adminKey||panelToken)&&Object.keys(keysData).length) renderTable(); },1000);
 </script>
 </body>
 </html>`);
