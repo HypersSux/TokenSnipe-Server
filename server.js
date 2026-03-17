@@ -1,20 +1,212 @@
 // ET Sniper — License Server v3
 // Two-tier access: superadmin (you) + panel users (can't create keys or users)
+// Discord bot: generates keys via slash commands, owner role only, your server only
 
 const express = require('express');
 const jwt     = require('jsonwebtoken');
 const crypto  = require('crypto');
 const fs      = require('fs');
 const path    = require('path');
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-const JWT_SECRET = process.env.JWT_SECRET;
-const ADMIN_KEY  = process.env.ADMIN_KEY; // your superadmin key — set in Railway vars
+const JWT_SECRET      = process.env.JWT_SECRET;
+const ADMIN_KEY       = process.env.ADMIN_KEY;
+const DISCORD_TOKEN   = process.env.DISCORD_TOKEN;    // your bot token
+const DISCORD_GUILD   = process.env.DISCORD_GUILD;    // your server ID
+const DISCORD_ROLE    = process.env.DISCORD_ROLE;     // owner role ID allowed to gen keys
 
 if (!JWT_SECRET) { console.error('FATAL: JWT_SECRET not set'); process.exit(1); }
 if (!ADMIN_KEY)  { console.error('FATAL: ADMIN_KEY not set');  process.exit(1); }
+
+// ── DISCORD BOT ───────────────────────────────────────────────────────────
+if (DISCORD_TOKEN && DISCORD_GUILD && DISCORD_ROLE) {
+
+  const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+  // Register slash commands
+  const commands = [
+    new SlashCommandBuilder()
+      .setName('genkey')
+      .setDescription('Generate a new TokenSnipe license key')
+      .addStringOption(o => o.setName('note').setDescription('Who is this key for?').setRequired(false))
+      .addStringOption(o => o.setName('duration').setDescription('How long? e.g. 7, 30, 90, lifetime').setRequired(false)),
+    new SlashCommandBuilder()
+      .setName('revokekey')
+      .setDescription('Revoke a TokenSnipe license key')
+      .addStringOption(o => o.setName('key').setDescription('The key to revoke e.g. ET-XXXXXXXXXXXXXXXX').setRequired(true)),
+    new SlashCommandBuilder()
+      .setName('keyinfo')
+      .setDescription('Look up info on a license key')
+      .addStringOption(o => o.setName('key').setDescription('The key to look up').setRequired(true)),
+    new SlashCommandBuilder()
+      .setName('resetwid')
+      .setDescription('Reset the HWID lock on a key')
+      .addStringOption(o => o.setName('key').setDescription('The key to reset').setRequired(true)),
+    new SlashCommandBuilder()
+      .setName('listkeys')
+      .setDescription('List all active keys'),
+  ].map(c => c.toJSON());
+
+  client.once('ready', async () => {
+    console.log(`Discord bot logged in as ${client.user.tag}`);
+    try {
+      const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
+      await rest.put(Routes.applicationGuildCommands(client.user.id, DISCORD_GUILD), { body: commands });
+      console.log('Discord slash commands registered');
+    } catch (e) { console.error('Failed to register commands:', e); }
+  });
+
+  client.on('interactionCreate', async interaction => {
+    if (!interaction.isChatInputCommand()) return;
+
+    // Only works in your server
+    if (interaction.guildId !== DISCORD_GUILD) {
+      return interaction.reply({ content: 'This bot only works in the TokenSnipe server.', ephemeral: true });
+    }
+
+    // Check if user has the required role
+    const member = interaction.member;
+    const hasRole = member.roles.cache.has(DISCORD_ROLE);
+    if (!hasRole) {
+      return interaction.reply({ content: 'You need the owner role to use this command.', ephemeral: true });
+    }
+
+    const { commandName } = interaction;
+
+    // ── /genkey ──────────────────────────────────────────────────────────
+    if (commandName === 'genkey') {
+      const note     = interaction.options.getString('note') || '';
+      const duration = interaction.options.getString('duration') || 'lifetime';
+      const key      = 'ET-' + crypto.randomBytes(8).toString('hex').toUpperCase();
+      const keys     = loadKeys();
+      const expiresAt = duration !== 'lifetime' && !isNaN(parseInt(duration))
+        ? new Date(Date.now() + parseInt(duration) * 86400000).toISOString()
+        : null;
+      keys[key] = {
+        active: true,
+        created: new Date().toISOString(),
+        note,
+        days: duration,
+        expiresAt,
+        activations: 0,
+        hwid: null,
+        lastUsed: null,
+        createdBy: interaction.user.tag,
+      };
+      saveKeys(keys);
+
+      const embed = new EmbedBuilder()
+        .setColor(0x10b981)
+        .setTitle('Key Generated')
+        .addFields(
+          { name: 'Key', value: '`' + key + '`', inline: false },
+          { name: 'Duration', value: expiresAt ? duration + ' days' : 'Lifetime', inline: true },
+          { name: 'Note', value: note || 'None', inline: true },
+          { name: 'Expires', value: expiresAt ? new Date(expiresAt).toLocaleDateString() : 'Never', inline: true }
+        )
+        .setFooter({ text: 'Generated by ' + interaction.user.tag })
+        .setTimestamp();
+
+      return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    // ── /revokekey ───────────────────────────────────────────────────────
+    if (commandName === 'revokekey') {
+      const key  = interaction.options.getString('key').toUpperCase();
+      const keys = loadKeys();
+      if (!keys[key]) return interaction.reply({ content: 'Key not found: `' + key + '`', ephemeral: true });
+      keys[key].active = false;
+      saveKeys(keys);
+
+      const embed = new EmbedBuilder()
+        .setColor(0xef4444)
+        .setTitle('Key Revoked')
+        .setDescription('`' + key + '` has been revoked. The user will be kicked within 5 minutes.')
+        .setFooter({ text: 'Revoked by ' + interaction.user.tag })
+        .setTimestamp();
+
+      return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    // ── /keyinfo ─────────────────────────────────────────────────────────
+    if (commandName === 'keyinfo') {
+      const key   = interaction.options.getString('key').toUpperCase();
+      const keys  = loadKeys();
+      const entry = keys[key];
+      if (!entry) return interaction.reply({ content: 'Key not found: `' + key + '`', ephemeral: true });
+
+      const now    = new Date();
+      const status = !entry.active ? 'Revoked' : (entry.expiresAt && new Date(entry.expiresAt) <= now) ? 'Expired' : 'Active';
+      const color  = status === 'Active' ? 0x10b981 : 0xef4444;
+
+      const embed = new EmbedBuilder()
+        .setColor(color)
+        .setTitle('Key Info: ' + key)
+        .addFields(
+          { name: 'Status', value: status, inline: true },
+          { name: 'Note', value: entry.note || 'None', inline: true },
+          { name: 'HWID', value: entry.hwid ? 'Locked' : 'Free', inline: true },
+          { name: 'Expires', value: entry.expiresAt ? new Date(entry.expiresAt).toLocaleDateString() : 'Never', inline: true },
+          { name: 'Uses', value: String(entry.activations || 0), inline: true },
+          { name: 'Last Used', value: entry.lastUsed ? new Date(entry.lastUsed).toLocaleDateString() : 'Never', inline: true },
+          { name: 'Created', value: new Date(entry.created).toLocaleDateString(), inline: true },
+          { name: 'Created By', value: entry.createdBy || 'Dashboard', inline: true },
+        )
+        .setTimestamp();
+
+      return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    // ── /resetwid ────────────────────────────────────────────────────────
+    if (commandName === 'resetwid') {
+      const key  = interaction.options.getString('key').toUpperCase();
+      const keys = loadKeys();
+      if (!keys[key]) return interaction.reply({ content: 'Key not found: `' + key + '`', ephemeral: true });
+      keys[key].hwid      = null;
+      keys[key].lockedAt  = null;
+      saveKeys(keys);
+
+      const embed = new EmbedBuilder()
+        .setColor(0xa78bfa)
+        .setTitle('HWID Reset')
+        .setDescription('`' + key + '` is now unlocked and can be activated on a new device.')
+        .setFooter({ text: 'Reset by ' + interaction.user.tag })
+        .setTimestamp();
+
+      return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    // ── /listkeys ────────────────────────────────────────────────────────
+    if (commandName === 'listkeys') {
+      const keys   = loadKeys();
+      const now    = new Date();
+      const active = Object.entries(keys).filter(([, v]) => v.active && (!v.expiresAt || new Date(v.expiresAt) > now));
+
+      if (!active.length) return interaction.reply({ content: 'No active keys found.', ephemeral: true });
+
+      const lines = active.slice(0, 20).map(([k, v]) => {
+        const exp = v.expiresAt ? new Date(v.expiresAt).toLocaleDateString() : 'Lifetime';
+        return '`' + k + '` — ' + (v.note || 'No note') + ' — ' + exp;
+      });
+
+      const embed = new EmbedBuilder()
+        .setColor(0x3b82f6)
+        .setTitle('Active Keys (' + active.length + ')')
+        .setDescription(lines.join('\n') + (active.length > 20 ? '\n...and ' + (active.length - 20) + ' more' : ''))
+        .setTimestamp();
+
+      return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+  });
+
+  client.login(DISCORD_TOKEN).catch(e => console.error('Discord login failed:', e));
+
+} else {
+  console.log('Discord bot disabled — set DISCORD_TOKEN, DISCORD_GUILD, DISCORD_ROLE to enable');
+}
 
 // ── DATABASES ─────────────────────────────────────────────────────────────
 const KEYS_FILE  = path.join(__dirname, 'keys.json');

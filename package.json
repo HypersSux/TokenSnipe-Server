@@ -1,7 +1,7 @@
 {
-  "name": "et-sniper-server",
-  "version": "1.0.0",
-  "description": "ET Sniper license validation server",
+  "name": "tokensnipe-server",
+  "version": "3.0.0",
+  "description": "TokenSnipe license server with Discord bot",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "express": "^4.18.2",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "discord.js": "^14.14.1"
   }
 }
