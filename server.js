@@ -50,7 +50,7 @@ if (DISCORD_TOKEN && DISCORD_GUILD && DISCORD_ROLE) {
       .setDescription('List all active keys'),
   ].map(c => c.toJSON());
 
-  client.once('ready', async () => {
+  client.once('clientReady', async () => {
     console.log(`Discord bot logged in as ${client.user.tag}`);
     try {
       const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
