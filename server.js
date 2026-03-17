@@ -1,5 +1,5 @@
-// ET Sniper — License Server v2
-// Features: HWID lock, expiry dates, admin dashboard
+// ET Sniper — License Server v3
+// Two-tier access: superadmin (you) + panel users (can't create keys or users)
 
 const express = require('express');
 const jwt     = require('jsonwebtoken');
@@ -11,25 +11,25 @@ const app  = express();
 const PORT = process.env.PORT || 3000;
 
 const JWT_SECRET = process.env.JWT_SECRET;
-const ADMIN_KEY  = process.env.ADMIN_KEY;
+const ADMIN_KEY  = process.env.ADMIN_KEY; // your superadmin key — set in Railway vars
 
 if (!JWT_SECRET) { console.error('FATAL: JWT_SECRET not set'); process.exit(1); }
 if (!ADMIN_KEY)  { console.error('FATAL: ADMIN_KEY not set');  process.exit(1); }
 
-// ── KEYS DB ───────────────────────────────────────────────────────────────
-const KEYS_FILE = path.join(__dirname, 'keys.json');
-function loadKeys() {
-  try { return JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8')); }
-  catch { return {}; }
-}
-function saveKeys(k) { fs.writeFileSync(KEYS_FILE, JSON.stringify(k, null, 2)); }
+// ── DATABASES ─────────────────────────────────────────────────────────────
+const KEYS_FILE  = path.join(__dirname, 'keys.json');
+const USERS_FILE = path.join(__dirname, 'users.json'); // panel user accounts
+
+function loadKeys()  { try { return JSON.parse(fs.readFileSync(KEYS_FILE,  'utf8')); } catch { return {}; } }
+function saveKeys(k) { fs.writeFileSync(KEYS_FILE,  JSON.stringify(k, null, 2)); }
+function loadUsers()  { try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch { return {}; } }
+function saveUsers(u) { fs.writeFileSync(USERS_FILE, JSON.stringify(u, null, 2)); }
 
 // ── MIDDLEWARE ────────────────────────────────────────────────────────────
 app.use(express.json());
-
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, x-et-token, x-hwid, x-admin-key');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, x-et-token, x-hwid, x-admin-key, x-panel-token');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
@@ -45,13 +45,36 @@ function rateLimit(key, max) {
   return e.count > max;
 }
 
-// ── AUTH MIDDLEWARE ───────────────────────────────────────────────────────
-function requireAdmin(req, res, next) {
-  const k = req.headers['x-admin-key'] || req.query.ak;
-  if (k !== ADMIN_KEY) return res.status(403).json({ error: 'Forbidden' });
+// ── AUTH HELPERS ──────────────────────────────────────────────────────────
+
+// Is this request from the superadmin?
+function isSuperAdmin(req) {
+  return (req.headers['x-admin-key'] || req.query.ak) === ADMIN_KEY;
+}
+
+// Require superadmin only
+function requireSuperAdmin(req, res, next) {
+  if (!isSuperAdmin(req)) return res.status(403).json({ error: 'Superadmin only' });
   next();
 }
 
+// Require superadmin OR a valid panel user token
+function requirePanel(req, res, next) {
+  if (isSuperAdmin(req)) { req.isSuperAdmin = true; return next(); }
+  const tok = req.headers['x-panel-token'];
+  if (!tok) return res.status(403).json({ error: 'Not authenticated' });
+  try {
+    const payload = jwt.verify(tok, JWT_SECRET + '_panel');
+    const users   = loadUsers();
+    if (!users[payload.username] || !users[payload.username].active)
+      return res.status(403).json({ error: 'Panel account revoked' });
+    req.panelUser    = payload.username;
+    req.isSuperAdmin = false;
+    next();
+  } catch { return res.status(403).json({ error: 'Invalid panel token' }); }
+}
+
+// Extension token validation
 function requireToken(req, res, next) {
   const token = req.headers['x-et-token'];
   const hwid  = req.headers['x-hwid'];
@@ -60,79 +83,59 @@ function requireToken(req, res, next) {
     const payload = jwt.verify(token, JWT_SECRET);
     const keys    = loadKeys();
     const entry   = keys[payload.key];
-    if (!entry || entry.active === false)
-      return res.status(401).json({ error: 'Key revoked' });
-    if (entry.expiresAt && new Date() > new Date(entry.expiresAt))
-      return res.status(401).json({ error: 'Key expired' });
-    if (entry.hwid && entry.hwid !== hwid)
-      return res.status(401).json({ error: 'HWID mismatch' });
+    if (!entry || !entry.active) return res.status(401).json({ error: 'Key revoked' });
+    if (entry.expiresAt && new Date() > new Date(entry.expiresAt)) return res.status(401).json({ error: 'Key expired' });
+    if (entry.hwid && entry.hwid !== hwid) return res.status(401).json({ error: 'HWID mismatch' });
     req.keyPayload = payload;
     next();
   } catch { return res.status(401).json({ error: 'Invalid or expired token' }); }
 }
 
-// ── PUBLIC ROUTES ─────────────────────────────────────────────────────────
+// ── EXTENSION ROUTES ──────────────────────────────────────────────────────
 
 app.post('/validate', (req, res) => {
   const { key, hwid } = req.body;
   if (!key || !hwid) return res.status(400).json({ valid: false, error: 'Missing fields' });
-
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
   if (rateLimit(ip, 5)) return res.status(429).json({ valid: false, error: 'Too many attempts. Wait a minute.' });
-
   const keys  = loadKeys();
   const entry = keys[key];
-
-  if (!entry || entry.active === false)
-    return res.json({ valid: false, error: 'Invalid or revoked key' });
-
-  if (entry.expiresAt && new Date() > new Date(entry.expiresAt))
-    return res.json({ valid: false, error: 'Key has expired' });
-
-  // HWID lock — lock on first use, reject mismatches after
-  if (!entry.hwid) {
-    entry.hwid      = hwid;
-    entry.lockedAt  = new Date().toISOString();
-  } else if (entry.hwid !== hwid) {
-    return res.json({ valid: false, error: 'Key is locked to another device' });
-  }
-
+  if (!entry || !entry.active) return res.json({ valid: false, error: 'Invalid or revoked key' });
+  if (entry.expiresAt && new Date() > new Date(entry.expiresAt)) return res.json({ valid: false, error: 'Key has expired' });
+  if (!entry.hwid) { entry.hwid = hwid; entry.lockedAt = new Date().toISOString(); }
+  else if (entry.hwid !== hwid) return res.json({ valid: false, error: 'Key is locked to another device' });
   entry.lastUsed    = new Date().toISOString();
   entry.activations = (entry.activations || 0) + 1;
   saveKeys(keys);
-
   const token = jwt.sign({ key, hwid }, JWT_SECRET, { expiresIn: '7d' });
   res.json({ valid: true, token });
 });
 
 app.get('/heartbeat', requireToken, (req, res) => res.json({ ok: true }));
 
-// ── ADMIN API ─────────────────────────────────────────────────────────────
+// ── PANEL LOGIN ───────────────────────────────────────────────────────────
 
-app.get('/admin/keys', requireAdmin, (req, res) => res.json(loadKeys()));
-
-app.post('/admin/keys/create', requireAdmin, (req, res) => {
-  const { note, days } = req.body;
-  const key       = 'ET-' + crypto.randomBytes(8).toString('hex').toUpperCase();
-  const keys      = loadKeys();
-  const expiresAt = days && days !== 'lifetime'
-    ? new Date(Date.now() + parseInt(days) * 86400000).toISOString()
-    : null;
-  keys[key] = {
-    active: true,
-    created: new Date().toISOString(),
-    note: note || '',
-    days: days || 'lifetime',
-    expiresAt,
-    activations: 0,
-    hwid: null,
-    lastUsed: null,
-  };
-  saveKeys(keys);
-  res.json({ key, expiresAt });
+// POST /panel/login — for panel users (not superadmin)
+app.post('/panel/login', (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ error: 'Missing fields' });
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  if (rateLimit('panel:' + ip, 5)) return res.status(429).json({ error: 'Too many attempts' });
+  const users = loadUsers();
+  const user  = users[username];
+  if (!user || !user.active) return res.status(403).json({ error: 'Invalid credentials' });
+  // Simple password hash check
+  const hash = crypto.createHash('sha256').update(password + JWT_SECRET).digest('hex');
+  if (hash !== user.passwordHash) return res.status(403).json({ error: 'Invalid credentials' });
+  const token = jwt.sign({ username }, JWT_SECRET + '_panel', { expiresIn: '24h' });
+  res.json({ ok: true, token, username });
 });
 
-app.post('/admin/keys/revoke', requireAdmin, (req, res) => {
+// ── ADMIN API — panel-accessible (all logged-in users) ───────────────────
+
+app.get('/admin/keys', requirePanel, (req, res) => res.json(loadKeys()));
+
+app.post('/admin/keys/revoke', requirePanel, (req, res) => {
   const { key } = req.body;
   const keys = loadKeys();
   if (!keys[key]) return res.status(404).json({ error: 'Not found' });
@@ -141,7 +144,7 @@ app.post('/admin/keys/revoke', requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/admin/keys/reactivate', requireAdmin, (req, res) => {
+app.post('/admin/keys/reactivate', requirePanel, (req, res) => {
   const { key } = req.body;
   const keys = loadKeys();
   if (!keys[key]) return res.status(404).json({ error: 'Not found' });
@@ -150,22 +153,73 @@ app.post('/admin/keys/reactivate', requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/admin/keys/reset-hwid', requireAdmin, (req, res) => {
+app.post('/admin/keys/reset-hwid', requirePanel, (req, res) => {
   const { key } = req.body;
   const keys = loadKeys();
   if (!keys[key]) return res.status(404).json({ error: 'Not found' });
-  keys[key].hwid     = null;
-  keys[key].lockedAt = null;
+  keys[key].hwid = null; keys[key].lockedAt = null;
   saveKeys(keys);
   res.json({ ok: true });
 });
 
-app.post('/admin/keys/delete', requireAdmin, (req, res) => {
+app.post('/admin/keys/delete', requirePanel, (req, res) => {
   const { key } = req.body;
   const keys = loadKeys();
   if (!keys[key]) return res.status(404).json({ error: 'Not found' });
   delete keys[key];
   saveKeys(keys);
+  res.json({ ok: true });
+});
+
+// ── ADMIN API — superadmin only ───────────────────────────────────────────
+
+app.post('/admin/keys/create', requireSuperAdmin, (req, res) => {
+  const { note, days } = req.body;
+  const key       = 'ET-' + crypto.randomBytes(8).toString('hex').toUpperCase();
+  const keys      = loadKeys();
+  const expiresAt = days && days !== 'lifetime'
+    ? new Date(Date.now() + parseInt(days) * 86400000).toISOString()
+    : null;
+  keys[key] = { active: true, created: new Date().toISOString(), note: note || '', days: days || 'lifetime', expiresAt, activations: 0, hwid: null, lastUsed: null };
+  saveKeys(keys);
+  res.json({ key, expiresAt });
+});
+
+// Panel user management — superadmin only
+app.get('/admin/users', requireSuperAdmin, (req, res) => {
+  const users = loadUsers();
+  // Strip password hashes before sending
+  const safe = {};
+  Object.entries(users).forEach(([u, v]) => { safe[u] = { active: v.active, created: v.created, note: v.note }; });
+  res.json(safe);
+});
+
+app.post('/admin/users/create', requireSuperAdmin, (req, res) => {
+  const { username, password, note } = req.body;
+  if (!username || !password) return res.status(400).json({ error: 'Missing fields' });
+  const users = loadUsers();
+  if (users[username]) return res.status(400).json({ error: 'Username already exists' });
+  const hash = crypto.createHash('sha256').update(password + JWT_SECRET).digest('hex');
+  users[username] = { active: true, created: new Date().toISOString(), note: note || '', passwordHash: hash };
+  saveUsers(users);
+  res.json({ ok: true });
+});
+
+app.post('/admin/users/revoke', requireSuperAdmin, (req, res) => {
+  const { username } = req.body;
+  const users = loadUsers();
+  if (!users[username]) return res.status(404).json({ error: 'Not found' });
+  users[username].active = false;
+  saveUsers(users);
+  res.json({ ok: true });
+});
+
+app.post('/admin/users/delete', requireSuperAdmin, (req, res) => {
+  const { username } = req.body;
+  const users = loadUsers();
+  if (!users[username]) return res.status(404).json({ error: 'Not found' });
+  delete users[username];
+  saveUsers(users);
   res.json({ ok: true });
 });
 
@@ -181,32 +235,37 @@ app.get('/admin', (req, res) => {
 <title>ET Sniper Admin</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-:root{--bg:#07090f;--surf:#0e1420;--card:#131c2e;--border:rgba(59,130,246,0.15);--blue:#3b82f6;--blt:#60a5fa;--t1:#f1f5f9;--t2:#94a3b8;--t3:#475569;--green:#10b981;--red:#ef4444;--gold:#f59e0b;--purple:#a78bfa}
+:root{--bg:#07090f;--surf:#0e1420;--card:#131c2e;--border:rgba(59,130,246,0.15);--bhi:rgba(59,130,246,0.3);--blue:#3b82f6;--blt:#60a5fa;--t1:#f1f5f9;--t2:#94a3b8;--t3:#475569;--green:#10b981;--red:#ef4444;--gold:#f59e0b;--purple:#a78bfa}
 body{background:var(--bg);color:var(--t1);font-family:'Segoe UI',system-ui,sans-serif;font-size:13px;min-height:100vh}
 #login{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.login-box{background:var(--surf);border:1px solid var(--border);border-radius:16px;padding:36px;width:100%;max-width:360px;display:flex;flex-direction:column;gap:16px;text-align:center}
+.login-box{background:var(--surf);border:1px solid var(--border);border-radius:16px;padding:36px;width:100%;max-width:380px;display:flex;flex-direction:column;gap:14px;text-align:center}
 .login-box h1{font-size:20px;font-weight:700}
+.login-tabs{display:flex;gap:6px;margin-bottom:2px}
+.ltab{flex:1;padding:7px;border-radius:8px;font-size:12px;font-weight:600;font-family:inherit;cursor:pointer;border:1px solid var(--border);background:transparent;color:var(--t3);transition:all .15s}
+.ltab.on{background:rgba(59,130,246,.12);border-color:var(--bhi);color:var(--blt)}
 input,select{width:100%;padding:9px 13px;background:var(--card);border:1px solid var(--border);border-radius:8px;color:var(--t1);font-size:13px;font-family:inherit;outline:none;transition:border-color .15s}
-input:focus{border-color:rgba(59,130,246,0.5)}
+input:focus{border-color:var(--bhi)}
 select option{background:var(--card)}
 #app{display:none;flex-direction:column;min-height:100vh}
 .topbar{background:var(--surf);border-bottom:1px solid var(--border);padding:12px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:10}
+.topbar-l{display:flex;align-items:center;gap:10px}
 .topbar h1{font-size:15px;font-weight:700}
-.topbar-badge{font-size:10px;padding:2px 8px;background:rgba(59,130,246,.1);border:1px solid var(--border);border-radius:20px;color:var(--blt);margin-left:10px}
+.role-badge{font-size:10px;padding:2px 8px;border-radius:20px;font-weight:700}
+.role-badge.super{background:rgba(234,179,8,.12);border:1px solid rgba(234,179,8,.3);color:var(--gold)}
+.role-badge.panel{background:rgba(59,130,246,.1);border:1px solid var(--border);color:var(--blt)}
 .main{padding:20px 24px;display:flex;flex-direction:column;gap:16px;max-width:1200px;margin:0 auto;width:100%}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
 .stat{background:var(--surf);border:1px solid var(--border);border-radius:10px;padding:14px 16px}
 .stat-val{font-size:26px;font-weight:700;margin-bottom:2px}
 .stat-label{font-size:10px;color:var(--t3);text-transform:uppercase;letter-spacing:.06em}
-.create-card{background:var(--surf);border:1px solid var(--border);border-radius:12px;padding:16px 20px}
-.create-card h2{font-size:11px;font-weight:700;margin-bottom:12px;color:var(--t3);text-transform:uppercase;letter-spacing:.08em}
-.create-row{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
+.card{background:var(--surf);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+.card-header{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.card-header h2{font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.08em}
+.card-body{padding:16px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
 .field{display:flex;flex-direction:column;gap:4px}
 .field label{font-size:10px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:.06em}
-.field input,.field select{min-width:160px}
-.keys-card{background:var(--surf);border:1px solid var(--border);border-radius:12px;overflow:hidden}
-.keys-header{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
-.keys-header h2{font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.08em}
+.field input,.field select{min-width:150px}
 .search{padding:6px 12px;background:var(--card);border:1px solid var(--border);border-radius:7px;color:var(--t1);font-size:12px;font-family:inherit;outline:none;width:220px}
 table{width:100%;border-collapse:collapse}
 th{padding:8px 12px;text-align:left;font-size:10px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid var(--border);white-space:nowrap}
@@ -223,7 +282,7 @@ tr:hover td{background:rgba(59,130,246,0.03)}
 .badge.free{background:rgba(100,116,139,.1);border:1px solid rgba(100,116,139,.2);color:var(--t3)}
 .actions{display:flex;gap:4px;flex-wrap:wrap}
 button{padding:5px 12px;border-radius:6px;font-size:11px;font-weight:600;font-family:inherit;cursor:pointer;border:1px solid;transition:all .15s;white-space:nowrap}
-.btn-primary{padding:9px 20px;background:linear-gradient(135deg,#1e40af,#3b82f6);border-color:rgba(59,130,246,.5);color:#fff;font-size:12px;border-radius:8px}
+.btn-primary{padding:9px 20px;background:linear-gradient(135deg,#1e40af,#3b82f6);border-color:var(--bhi);color:#fff;font-size:12px;border-radius:8px}
 .btn-primary:hover{opacity:.9}
 .btn-revoke{background:rgba(239,68,68,.08);border-color:rgba(239,68,68,.3);color:#f87171}
 .btn-revoke:hover{background:rgba(239,68,68,.2)}
@@ -235,22 +294,20 @@ button{padding:5px 12px;border-radius:6px;font-size:11px;font-weight:600;font-fa
 .btn-delete:hover{background:rgba(239,68,68,.15);color:#f87171}
 .btn-logout{background:transparent;border-color:var(--border);color:var(--t3)}
 .btn-logout:hover{border-color:rgba(239,68,68,.3);color:#f87171}
-.filter-tabs{display:flex;gap:4px}
 .ftab{background:transparent;border:1px solid var(--border);color:var(--t3);border-radius:20px;padding:3px 12px;font-size:11px}
-.ftab.on{background:rgba(59,130,246,.1);border-color:rgba(59,130,246,.3);color:var(--blt)}
+.ftab.on{background:rgba(59,130,246,.1);border-color:var(--bhi);color:var(--blt)}
 .note-col{color:var(--t2);max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.expiry-ok{color:var(--green)}
-.expiry-soon{color:var(--gold)}
-.expiry-exp{color:var(--red)}
-.expiry-never{color:var(--t3)}
+.expiry-ok{color:var(--green)}.expiry-soon{color:var(--gold)}.expiry-exp{color:var(--red)}.expiry-never{color:var(--t3)}
 .new-key-box{margin-top:12px;padding:10px 14px;background:rgba(16,185,129,0.06);border:1px solid rgba(16,185,129,0.2);border-radius:8px;display:none}
 .new-key-box p{font-size:10px;color:var(--t3);margin-bottom:4px}
 .new-key-val{font-family:monospace;font-size:15px;color:var(--green);font-weight:700;cursor:pointer}
+.superonly{display:none}
 .toast{position:fixed;bottom:20px;right:20px;padding:10px 18px;background:var(--card);border:1px solid var(--border);border-radius:10px;font-size:12px;font-weight:600;z-index:100;animation:tin .2s ease;pointer-events:none}
 .toast.ok{border-color:rgba(16,185,129,.4);color:var(--green)}
 .toast.err{border-color:rgba(239,68,68,.4);color:var(--red)}
 @keyframes tin{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 .empty-row td{text-align:center;padding:32px;color:var(--t3)}
+.divider{height:1px;background:var(--border);margin:4px 0}
 </style>
 </head>
 <body>
@@ -260,9 +317,19 @@ button{padding:5px 12px;border-radius:6px;font-size:11px;font-weight:600;font-fa
     <div>
       <div style="font-size:32px;margin-bottom:8px">🔑</div>
       <h1>ET Sniper Admin</h1>
-      <p style="color:var(--t3);font-size:12px;margin-top:6px">Enter your admin key to continue</p>
+      <p style="color:var(--t3);font-size:12px;margin-top:4px">Sign in to manage keys</p>
     </div>
-    <input id="ak" type="password" placeholder="Admin key..." />
+    <div class="login-tabs">
+      <button class="ltab on" id="tab-admin" onclick="switchLoginTab('admin')">Superadmin</button>
+      <button class="ltab" id="tab-panel" onclick="switchLoginTab('panel')">Panel User</button>
+    </div>
+    <div id="login-admin">
+      <input id="ak" type="password" placeholder="Admin key..." />
+    </div>
+    <div id="login-panel" style="display:none;display:flex;flex-direction:column;gap:8px">
+      <input id="pu-user" type="text" placeholder="Username" autocomplete="off" />
+      <input id="pu-pass" type="password" placeholder="Password" />
+    </div>
     <button class="btn-primary" onclick="doLogin()">Login</button>
     <div id="lerr" style="color:var(--red);font-size:11px;min-height:14px"></div>
   </div>
@@ -270,14 +337,18 @@ button{padding:5px 12px;border-radius:6px;font-size:11px;font-weight:600;font-fa
 
 <div id="app">
   <div class="topbar">
-    <div style="display:flex;align-items:center">
-      <h1>ET Sniper — Key Manager</h1>
-      <span class="topbar-badge" id="total-badge">0 keys</span>
+    <div class="topbar-l">
+      <h1>ET Sniper</h1>
+      <span class="role-badge super" id="role-badge">Superadmin</span>
     </div>
-    <button class="btn-logout" onclick="logout()">Logout</button>
+    <div style="display:flex;align-items:center;gap:8px">
+      <span id="whoami" style="font-size:11px;color:var(--t3)"></span>
+      <button class="btn-logout" onclick="logout()">Logout</button>
+    </div>
   </div>
 
   <div class="main">
+    <!-- Stats -->
     <div class="stats">
       <div class="stat"><div class="stat-val" id="s-total" style="color:var(--blt)">0</div><div class="stat-label">Total Keys</div></div>
       <div class="stat"><div class="stat-val" id="s-active" style="color:var(--green)">0</div><div class="stat-label">Active</div></div>
@@ -286,40 +357,56 @@ button{padding:5px 12px;border-radius:6px;font-size:11px;font-weight:600;font-fa
       <div class="stat"><div class="stat-val" id="s-uses" style="color:var(--purple)">0</div><div class="stat-label">Total Uses</div></div>
     </div>
 
-    <div class="create-card">
-      <h2>Generate New Key</h2>
-      <div class="create-row">
-        <div class="field">
-          <label>Note / Username</label>
-          <input id="c-note" type="text" placeholder="e.g. Discord user xyz" />
+    <!-- Create key — superadmin only -->
+    <div class="card superonly" id="create-key-card">
+      <div class="card-header"><h2>Generate New Key</h2></div>
+      <div class="card-body">
+        <div class="row">
+          <div class="field"><label>Note / Username</label><input id="c-note" type="text" placeholder="e.g. Discord user xyz" /></div>
+          <div class="field">
+            <label>Duration</label>
+            <select id="c-days">
+              <option value="1">1 day</option><option value="3">3 days</option>
+              <option value="7">7 days</option><option value="14">14 days</option>
+              <option value="30">30 days</option><option value="90">90 days</option>
+              <option value="180">6 months</option><option value="365">1 year</option>
+              <option value="lifetime" selected>Lifetime</option>
+            </select>
+          </div>
+          <button class="btn-primary" onclick="createKey()">+ Generate Key</button>
         </div>
-        <div class="field">
-          <label>Duration</label>
-          <select id="c-days">
-            <option value="1">1 day</option>
-            <option value="3">3 days</option>
-            <option value="7">7 days</option>
-            <option value="14">14 days</option>
-            <option value="30">30 days</option>
-            <option value="90">90 days</option>
-            <option value="180">6 months</option>
-            <option value="365">1 year</option>
-            <option value="lifetime" selected>Lifetime</option>
-          </select>
+        <div class="new-key-box" id="new-key-box">
+          <p>New key created — click to copy:</p>
+          <div class="new-key-val" id="new-key-val"></div>
         </div>
-        <button class="btn-primary" onclick="createKey()">+ Generate Key</button>
-      </div>
-      <div class="new-key-box" id="new-key-box">
-        <p>New key created — click to copy:</p>
-        <div class="new-key-val" id="new-key-val" onclick="copyText(this.textContent)"></div>
       </div>
     </div>
 
-    <div class="keys-card">
-      <div class="keys-header">
+    <!-- Panel users — superadmin only -->
+    <div class="card superonly" id="users-card">
+      <div class="card-header"><h2>Panel Users</h2></div>
+      <div class="card-body">
+        <div class="row" style="margin-bottom:12px">
+          <div class="field"><label>Username</label><input id="u-name" type="text" placeholder="username" autocomplete="off" /></div>
+          <div class="field"><label>Password</label><input id="u-pass" type="text" placeholder="password" /></div>
+          <div class="field"><label>Note</label><input id="u-note" type="text" placeholder="optional note" /></div>
+          <button class="btn-primary" onclick="createUser()">+ Add User</button>
+        </div>
+        <div style="overflow-x:auto">
+          <table>
+            <thead><tr><th>Username</th><th>Note</th><th>Status</th><th>Actions</th></tr></thead>
+            <tbody id="users-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Keys table — everyone -->
+    <div class="card">
+      <div class="card-header">
         <h2>All Keys</h2>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <div class="filter-tabs">
+          <div style="display:flex;gap:4px">
             <button class="ftab on" onclick="setFilter('all',this)">All</button>
             <button class="ftab" onclick="setFilter('active',this)">Active</button>
             <button class="ftab" onclick="setFilter('revoked',this)">Revoked</button>
@@ -330,11 +417,7 @@ button{padding:5px 12px;border-radius:6px;font-size:11px;font-weight:600;font-fa
       </div>
       <div style="overflow-x:auto">
         <table>
-          <thead>
-            <tr>
-              <th>Key</th><th>Note</th><th>Status</th><th>HWID</th><th>Expires</th><th>Uses</th><th>Last Used</th><th>Actions</th>
-            </tr>
-          </thead>
+          <thead><tr><th>Key</th><th>Note</th><th>Status</th><th>HWID</th><th>Expires</th><th>Uses</th><th>Last Used</th><th>Actions</th></tr></thead>
           <tbody id="keys-body"></tbody>
         </table>
       </div>
@@ -343,42 +426,89 @@ button{padding:5px 12px;border-radius:6px;font-size:11px;font-weight:600;font-fa
 </div>
 
 <script>
-let adminKey='',keysData={},filterMode='all';
+let adminKey='', panelToken='', isSuperAdmin=false, whoami='';
+let keysData={}, usersData={}, filterMode='all', loginTab='admin';
 
-function doLogin(){
-  adminKey=document.getElementById('ak').value.trim();
-  if(!adminKey)return;
-  fetchKeys().then(ok=>{
-    if(ok){
-      document.getElementById('login').style.display='none';
-      document.getElementById('app').style.display='flex';
-    }else{
-      document.getElementById('lerr').textContent='Invalid admin key.';
-    }
-  });
+function switchLoginTab(tab){
+  loginTab=tab;
+  document.getElementById('tab-admin').classList.toggle('on', tab==='admin');
+  document.getElementById('tab-panel').classList.toggle('on', tab==='panel');
+  document.getElementById('login-admin').style.display = tab==='admin'?'block':'none';
+  document.getElementById('login-panel').style.display = tab==='panel'?'flex':'none';
 }
-document.getElementById('ak').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin();});
+switchLoginTab('admin');
+
+async function doLogin(){
+  document.getElementById('lerr').textContent='';
+  if(loginTab==='admin'){
+    adminKey=document.getElementById('ak').value.trim();
+    if(!adminKey)return;
+    const ok=await fetchKeys(true);
+    if(ok){ isSuperAdmin=true; whoami='Superadmin'; showApp(); }
+    else{ document.getElementById('lerr').textContent='Invalid admin key.'; adminKey=''; }
+  } else {
+    const user=document.getElementById('pu-user').value.trim();
+    const pass=document.getElementById('pu-pass').value.trim();
+    if(!user||!pass)return;
+    try{
+      const res=await fetch('/panel/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:user,password:pass})});
+      const data=await res.json();
+      if(data.ok){ panelToken=data.token; isSuperAdmin=false; whoami=user; const ok=await fetchKeys(false); if(ok)showApp(); }
+      else document.getElementById('lerr').textContent=data.error||'Invalid credentials.';
+    }catch{ document.getElementById('lerr').textContent='Connection error.'; }
+  }
+}
+document.addEventListener('keydown',e=>{if(e.key==='Enter'&&document.getElementById('login').style.display!=='none')doLogin();});
+
+function showApp(){
+  document.getElementById('login').style.display='none';
+  document.getElementById('app').style.display='flex';
+  document.getElementById('whoami').textContent=whoami;
+  const badge=document.getElementById('role-badge');
+  if(isSuperAdmin){ badge.textContent='Superadmin'; badge.className='role-badge super'; }
+  else { badge.textContent='Panel User'; badge.className='role-badge panel'; }
+  document.querySelectorAll('.superonly').forEach(el=>{ el.style.display=isSuperAdmin?'block':'none'; });
+  if(isSuperAdmin) fetchUsers();
+}
 
 function logout(){
-  adminKey='';keysData={};
+  adminKey=''; panelToken=''; isSuperAdmin=false; whoami=''; keysData={}; usersData={};
   document.getElementById('login').style.display='flex';
   document.getElementById('app').style.display='none';
   document.getElementById('ak').value='';
+  document.getElementById('pu-user').value='';
+  document.getElementById('pu-pass').value='';
+}
+
+function getHeaders(){
+  const h={'Content-Type':'application/json'};
+  if(isSuperAdmin) h['x-admin-key']=adminKey;
+  else h['x-panel-token']=panelToken;
+  return h;
 }
 
 async function api(path,method='GET',body=null){
-  const opts={method,headers:{'x-admin-key':adminKey,'Content-Type':'application/json'}};
+  const opts={method,headers:getHeaders()};
   if(body)opts.body=JSON.stringify(body);
   const res=await fetch(path,opts);
   return res.json();
 }
 
-async function fetchKeys(){
+async function fetchKeys(isAdmin){
   try{
-    const data=await api('/admin/keys');
+    const headers={'Content-Type':'application/json'};
+    if(isAdmin) headers['x-admin-key']=adminKey;
+    else headers['x-panel-token']=panelToken;
+    const res=await fetch('/admin/keys',{headers});
+    const data=await res.json();
     if(data.error)return false;
-    keysData=data;renderTable();updateStats();return true;
+    keysData=data; renderTable(); updateStats(); return true;
   }catch{return false;}
+}
+
+async function fetchUsers(){
+  const data=await api('/admin/users');
+  if(!data.error){ usersData=data; renderUsers(); }
 }
 
 function updateStats(){
@@ -388,21 +518,11 @@ function updateStats(){
   document.getElementById('s-revoked').textContent=vals.filter(k=>!k.active).length;
   document.getElementById('s-expired').textContent=vals.filter(k=>k.active&&k.expiresAt&&new Date(k.expiresAt)<=now).length;
   document.getElementById('s-uses').textContent=vals.reduce((a,k)=>a+(k.activations||0),0);
-  document.getElementById('total-badge').textContent=vals.length+' keys';
 }
 
-function setFilter(mode,el){
-  filterMode=mode;
-  document.querySelectorAll('.ftab').forEach(b=>b.classList.remove('on'));
-  el.classList.add('on');renderTable();
-}
+function setFilter(mode,el){ filterMode=mode; document.querySelectorAll('.ftab').forEach(b=>b.classList.remove('on')); el.classList.add('on'); renderTable(); }
 
-function getStatus(k){
-  const now=new Date();
-  if(!k.active)return'revoked';
-  if(k.expiresAt&&new Date(k.expiresAt)<=now)return'expired';
-  return'active';
-}
+function getStatus(k){ const now=new Date(); if(!k.active)return'revoked'; if(k.expiresAt&&new Date(k.expiresAt)<=now)return'expired'; return'active'; }
 
 function fmtExpiry(k){
   if(!k.expiresAt)return'<span class="expiry-never">Lifetime</span>';
@@ -412,11 +532,7 @@ function fmtExpiry(k){
   return'<span class="expiry-ok">'+str+'</span>';
 }
 
-function fmtDate(d){
-  if(!d)return'<span style="color:var(--t3)">Never</span>';
-  return new Date(d).toLocaleDateString()+' '+new Date(d).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
-}
-
+function fmtDate(d){ if(!d)return'<span style="color:var(--t3)">Never</span>'; return new Date(d).toLocaleDateString()+' '+new Date(d).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}); }
 function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 
 function renderTable(){
@@ -457,56 +573,104 @@ function renderTable(){
     body.appendChild(tr);
   });
 }
+
+function renderUsers(){
+  const body=document.getElementById('users-body');
+  const entries=Object.entries(usersData);
+  if(!entries.length){body.innerHTML='<tr class="empty-row"><td colspan="4">No panel users yet</td></tr>';return;}
+  body.innerHTML='';
+  entries.forEach(([u,v])=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML='<td style="font-weight:600">'+esc(u)+'</td>'
+      +'<td style="color:var(--t2)">'+esc(v.note||'-')+'</td>'
+      +'<td><span class="badge '+(v.active?'active':'revoked')+'">'+(v.active?'Active':'Revoked')+'</span></td>'
+      +'<td><div class="actions"></div></td>';
+    const acts=tr.querySelector('.actions');
+    if(v.active){
+      const b1=document.createElement('button');b1.className='btn-revoke';b1.textContent='Revoke';b1.onclick=()=>revokeUser(u);acts.appendChild(b1);
+    }
+    const b2=document.createElement('button');b2.className='btn-delete';b2.textContent='Delete';b2.onclick=()=>deleteUser(u);acts.appendChild(b2);
+    body.appendChild(tr);
+  });
+}
+
 async function createKey(){
   const note=document.getElementById('c-note').value.trim();
   const days=document.getElementById('c-days').value;
   const data=await api('/admin/keys/create','POST',{note,days});
   if(data.key){
     document.getElementById('new-key-box').style.display='block';
-    document.getElementById('new-key-val').textContent=data.key;
+    const el=document.getElementById('new-key-val');
+    el.textContent=data.key;
+    el.onclick=()=>copyText(data.key);
     copyText(data.key);
     toast('Key created + copied!','ok');
-    await fetchKeys();
-  }else toast('Error creating key','err');
+    await fetchKeys(isSuperAdmin);
+  }else toast(data.error||'Error creating key','err');
 }
 
 async function revoke(key){
-  if(!confirm('Revoke '+key+'?\\nUser will be kicked within 5 minutes.'))return;
+  if(!confirm('Revoke '+key+'? User will be kicked within 5 min.'))return;
   const data=await api('/admin/keys/revoke','POST',{key});
-  if(data.ok){toast('Key revoked','ok');await fetchKeys();}else toast('Error','err');
+  if(data.ok){toast('Key revoked','ok');await fetchKeys(isSuperAdmin);}else toast('Error','err');
 }
 
 async function reactivate(key){
   const data=await api('/admin/keys/reactivate','POST',{key});
-  if(data.ok){toast('Key reactivated','ok');await fetchKeys();}else toast('Error','err');
+  if(data.ok){toast('Key reactivated','ok');await fetchKeys(isSuperAdmin);}else toast('Error','err');
 }
 
 async function resetHwid(key){
-  if(!confirm('Reset HWID for '+key+'?\\nKey can be used on a new device.'))return;
+  if(!confirm('Reset HWID for '+key+'? Key can be used on a new device.'))return;
   const data=await api('/admin/keys/reset-hwid','POST',{key});
-  if(data.ok){toast('HWID reset','ok');await fetchKeys();}else toast('Error','err');
+  if(data.ok){toast('HWID reset','ok');await fetchKeys(isSuperAdmin);}else toast('Error','err');
 }
 
 async function del(key){
   if(!confirm('Permanently DELETE '+key+'? Cannot be undone.'))return;
   const data=await api('/admin/keys/delete','POST',{key});
-  if(data.ok){toast('Key deleted','ok');await fetchKeys();}else toast('Error','err');
+  if(data.ok){toast('Key deleted','ok');await fetchKeys(isSuperAdmin);}else toast('Error','err');
 }
 
-function copyText(t){navigator.clipboard.writeText(t).then(()=>toast('Copied: '+t,'ok'));}
+async function createUser(){
+  const username=document.getElementById('u-name').value.trim();
+  const password=document.getElementById('u-pass').value.trim();
+  const note=document.getElementById('u-note').value.trim();
+  if(!username||!password){toast('Username and password required','err');return;}
+  const data=await api('/admin/users/create','POST',{username,password,note});
+  if(data.ok){
+    toast('Panel user created!','ok');
+    document.getElementById('u-name').value='';
+    document.getElementById('u-pass').value='';
+    document.getElementById('u-note').value='';
+    await fetchUsers();
+  }else toast(data.error||'Error','err');
+}
+
+async function revokeUser(username){
+  if(!confirm('Revoke access for '+username+'?'))return;
+  const data=await api('/admin/users/revoke','POST',{username});
+  if(data.ok){toast('User revoked','ok');await fetchUsers();}else toast('Error','err');
+}
+
+async function deleteUser(username){
+  if(!confirm('Delete panel user '+username+'?'))return;
+  const data=await api('/admin/users/delete','POST',{username});
+  if(data.ok){toast('User deleted','ok');await fetchUsers();}else toast('Error','err');
+}
+
+function copyText(t){navigator.clipboard.writeText(t).then(()=>toast('Copied!','ok'));}
 
 let tTimer;
 function toast(msg,type='ok'){
-  const el=document.createElement('div');
-  el.className='toast '+type;el.textContent=msg;
-  document.body.appendChild(el);
-  clearTimeout(tTimer);tTimer=setTimeout(()=>el.remove(),2800);
+  const el=document.createElement('div');el.className='toast '+type;el.textContent=msg;
+  document.body.appendChild(el);clearTimeout(tTimer);tTimer=setTimeout(()=>el.remove(),2800);
 }
 
-setInterval(()=>{if(adminKey)fetchKeys();},30000);
+setInterval(()=>{ if(adminKey||panelToken) fetchKeys(isSuperAdmin); },30000);
 </script>
 </body>
 </html>`);
 });
 
-app.listen(PORT, () => console.log('ET Sniper server running on port', PORT));
+app.listen(PORT, () => console.log('ET Sniper server v3 running on port', PORT));
