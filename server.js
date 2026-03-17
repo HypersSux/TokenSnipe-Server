@@ -431,31 +431,32 @@ function renderTable(){
   });
   entries.sort((a,b)=>new Date(b[1].created)-new Date(a[1].created));
   if(!entries.length){body.innerHTML='<tr class="empty-row"><td colspan="8">No keys found</td></tr>';return;}
-  body.innerHTML=entries.map(([k,v])=>{
+  body.innerHTML='';
+  entries.forEach(([k,v])=>{
     const st=getStatus(v);
+    const tr=document.createElement('tr');
     const hwidBadge=v.hwid?'<span class="badge locked">Locked</span>':'<span class="badge free">Free</span>';
-    let actions='';
-    if(st==='revoked'){
-      actions='<button class="btn-activate" onclick="reactivate(\''+k+'\')">Reactivate</button>'
-              +'<button class="btn-delete" onclick="del(\''+k+'\')">Delete</button>';
-    }else{
-      actions='<button class="btn-revoke" onclick="revoke(\''+k+'\')">Revoke</button>'
-              +(v.hwid?'<button class="btn-hwid" onclick="resetHwid(\''+k+'\')">Reset HWID</button>':'')
-              +'<button class="btn-delete" onclick="del(\''+k+'\')">Delete</button>';
-    }
-    return'<tr>'
-      +'<td><span class="key-mono" onclick="copyText(\''+k+'\')" title="Click to copy">'+k+'</span></td>'
-      +'<td><span class="note-col" title="'+esc(v.note||'')+'">'+esc(v.note||'—')+'</span></td>'
+    tr.innerHTML='<td><span class="key-mono" title="Click to copy">'+k+'</span></td>'
+      +'<td><span class="note-col" title="'+esc(v.note||'')+'">'+esc(v.note||'-')+'</span></td>'
       +'<td><span class="badge '+st+'">'+st.charAt(0).toUpperCase()+st.slice(1)+'</span></td>'
       +'<td>'+hwidBadge+'</td>'
       +'<td>'+fmtExpiry(v)+'</td>'
       +'<td style="color:var(--purple)">'+(v.activations||0)+'</td>'
       +'<td style="color:var(--t3);font-size:11px">'+fmtDate(v.lastUsed)+'</td>'
-      +'<td><div class="actions">'+actions+'</div></td>'
-      +'</tr>';
-  }).join('');
+      +'<td><div class="actions"></div></td>';
+    tr.querySelector('.key-mono').addEventListener('click',()=>copyText(k));
+    const acts=tr.querySelector('.actions');
+    if(st==='revoked'){
+      const b1=document.createElement('button');b1.className='btn-activate';b1.textContent='Reactivate';b1.onclick=()=>reactivate(k);acts.appendChild(b1);
+      const b2=document.createElement('button');b2.className='btn-delete';b2.textContent='Delete';b2.onclick=()=>del(k);acts.appendChild(b2);
+    }else{
+      const b1=document.createElement('button');b1.className='btn-revoke';b1.textContent='Revoke';b1.onclick=()=>revoke(k);acts.appendChild(b1);
+      if(v.hwid){const b2=document.createElement('button');b2.className='btn-hwid';b2.textContent='Reset HWID';b2.onclick=()=>resetHwid(k);acts.appendChild(b2);}
+      const b3=document.createElement('button');b3.className='btn-delete';b3.textContent='Delete';b3.onclick=()=>del(k);acts.appendChild(b3);
+    }
+    body.appendChild(tr);
+  });
 }
-
 async function createKey(){
   const note=document.getElementById('c-note').value.trim();
   const days=document.getElementById('c-days').value;
