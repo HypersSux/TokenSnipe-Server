@@ -171,7 +171,8 @@ app.post('/admin/keys/delete', requireAdmin, (req, res) => {
 
 // ── ADMIN DASHBOARD ───────────────────────────────────────────────────────
 app.get('/admin', (req, res) => {
-  res.setHeader('Content-Type', 'text/html');
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:;");
   res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
