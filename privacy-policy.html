@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TokenSnipe — Privacy Policy</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #07090f;
+    color: #f1f5f9;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    font-size: 15px;
+    line-height: 1.7;
+    padding: 40px 20px;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 28px; font-weight: 700; margin-bottom: 6px; }
+  .subtitle { color: #94a3b8; font-size: 13px; margin-bottom: 40px; }
+  h2 { font-size: 16px; font-weight: 700; margin: 32px 0 10px; color: #60a5fa; text-transform: uppercase; letter-spacing: .06em; }
+  p { color: #cbd5e1; margin-bottom: 12px; }
+  ul { color: #cbd5e1; padding-left: 20px; margin-bottom: 12px; }
+  ul li { margin-bottom: 6px; }
+  a { color: #60a5fa; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .divider { height: 1px; background: rgba(59,130,246,0.15); margin: 32px 0; }
+  .highlight { background: rgba(59,130,246,0.08); border: 1px solid rgba(59,130,246,0.2); border-radius: 8px; padding: 14px 18px; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>TokenSnipe</h1>
+  <div class="subtitle">Privacy Policy &nbsp;·&nbsp; Last updated: March 2026</div>
+
+  <div class="highlight">
+    <p>TokenSnipe is a Chrome browser extension that displays host and creator information for matches on EliteTokens.gg. This policy explains what data we collect, how it is used, and your rights.</p>
+  </div>
+
+  <h2>1. Information We Collect</h2>
+  <p>TokenSnipe collects the minimum data necessary to provide its functionality:</p>
+  <ul>
+    <li><strong>License Key</strong> — the activation key you enter to use the extension. This is sent to our validation server to verify your membership.</li>
+    <li><strong>Device Fingerprint (HWID)</strong> — a non-reversible identifier derived from your browser and hardware properties (screen resolution, timezone, language, etc.). This is used solely to bind your license to your device and prevent key sharing. It is never used for tracking or advertising.</li>
+    <li><strong>Session Token</strong> — a short-lived JWT token issued after successful activation, stored locally in your browser. It expires every 7 days and is used to authenticate your session.</li>
+    <li><strong>Key Expiry Date</strong> — the expiration date of your license, stored locally so the extension can display how long you have remaining.</li>
+  </ul>
+
+  <div class="divider"></div>
+
+  <h2>2. Information We Do NOT Collect</h2>
+  <ul>
+    <li>We do not collect your name, email address, or any personally identifiable information.</li>
+    <li>We do not collect your browsing history outside of elitetokens.gg.</li>
+    <li>We do not track your activity on elitetokens.gg beyond what is necessary to display match host information.</li>
+    <li>We do not sell, rent, or share any data with third parties.</li>
+    <li>We do not use analytics, advertising, or tracking services of any kind.</li>
+  </ul>
+
+  <div class="divider"></div>
+
+  <h2>3. How We Use Your Data</h2>
+  <ul>
+    <li><strong>License validation</strong> — your key and HWID are sent to our server once when you activate, and again every 7 days to renew your session token.</li>
+    <li><strong>Session verification</strong> — every 5 minutes, your session token is silently verified to ensure your membership is still active. No personal data is transmitted during this check.</li>
+    <li><strong>Revocation</strong> — if your license is revoked, the server communicates this during the next session check and your local session is cleared.</li>
+  </ul>
+
+  <div class="divider"></div>
+
+  <h2>4. Data Storage</h2>
+  <p>All data collected by TokenSnipe is stored:</p>
+  <ul>
+    <li><strong>Locally</strong> — your session token, HWID, and expiry date are stored in Chrome's local extension storage (<code>chrome.storage.local</code>). This data never leaves your device except as described above.</li>
+    <li><strong>On our server</strong> — only your license key, its status (active/revoked), and your HWID are stored server-side. No browsing data is stored.</li>
+  </ul>
+
+  <div class="divider"></div>
+
+  <h2>5. Third-Party Services</h2>
+  <p>TokenSnipe communicates with:</p>
+  <ul>
+    <li><strong>elitetokens.gg</strong> — to read publicly visible match and participant data displayed on the page you are visiting.</li>
+    <li><strong>Our validation server</strong> — hosted on Railway (railway.app) for license verification only.</li>
+  </ul>
+  <p>We do not integrate with Google Analytics, Facebook, or any advertising platforms.</p>
+
+  <div class="divider"></div>
+
+  <h2>6. Permissions Explanation</h2>
+  <ul>
+    <li><strong>storage</strong> — to save your session token and expiry date locally on your device.</li>
+    <li><strong>alarms</strong> — to run a background check every 5 minutes that verifies your membership is still active. This is the only purpose this permission is used for.</li>
+    <li><strong>tabs</strong> — to detect when you navigate to elitetokens.gg so the extension can display match information relevant to the page you are on.</li>
+    <li><strong>host_permissions (elitetokens.gg)</strong> — to read match data from the EliteTokens.gg website.</li>
+    <li><strong>host_permissions (our server)</strong> — to communicate with our license validation server.</li>
+  </ul>
+
+  <div class="divider"></div>
+
+  <h2>7. Data Retention</h2>
+  <p>Your local data (token, HWID, expiry) is cleared when you log out of the extension or when your license is revoked. Server-side records are deleted upon request.</p>
+
+  <div class="divider"></div>
+
+  <h2>8. Your Rights</h2>
+  <p>You may request deletion of any data associated with your license key by contacting us on Discord. Upon request, we will delete your key record and any associated HWID from our server within 7 days.</p>
+
+  <div class="divider"></div>
+
+  <h2>9. Changes to This Policy</h2>
+  <p>We may update this privacy policy from time to time. Changes will be posted on this page with an updated date. Continued use of the extension constitutes acceptance of the updated policy.</p>
+
+  <div class="divider"></div>
+
+  <h2>10. Contact</h2>
+  <p>For privacy questions or data deletion requests, contact us via our <a href="https://discord.gg/B8b9Acre2x" target="_blank">Discord server</a>.</p>
+
+</div>
+</body>
+</html>
