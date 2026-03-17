@@ -108,10 +108,14 @@ app.post('/validate', (req, res) => {
   entry.activations = (entry.activations || 0) + 1;
   saveKeys(keys);
   const token = jwt.sign({ key, hwid }, JWT_SECRET, { expiresIn: '7d' });
-  res.json({ valid: true, token });
+  res.json({ valid: true, token, expiresAt: entry.expiresAt || null, note: entry.note || '' });
 });
 
-app.get('/heartbeat', requireToken, (req, res) => res.json({ ok: true }));
+app.get('/heartbeat', requireToken, (req, res) => {
+  const keys  = loadKeys();
+  const entry = keys[req.keyPayload.key];
+  res.json({ ok: true, expiresAt: entry?.expiresAt || null, note: entry?.note || '' });
+});
 
 // ── PANEL LOGIN ───────────────────────────────────────────────────────────
 
