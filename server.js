@@ -19,6 +19,10 @@ const DISCORD_ROLE  = process.env.DISCORD_ROLE;
 if (!JWT_SECRET) { console.error('FATAL: JWT_SECRET not set'); process.exit(1); }
 if (!ADMIN_KEY)  { console.error('FATAL: ADMIN_KEY not set');  process.exit(1); }
 
+// Minimum app version — set MIN_VERSION in Railway variables to force updates
+// Old builds that don't send x-app-version will be rejected automatically
+const MIN_VERSION = parseInt(process.env.MIN_VERSION || '2');
+
 // ── DISCORD BOT ───────────────────────────────────────────────────────────
 if (DISCORD_TOKEN && DISCORD_GUILD && DISCORD_ROLE) {
 
@@ -675,7 +679,7 @@ function saveUsers(u) {
 app.use(express.json());
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, x-et-token, x-hwid, x-admin-key, x-panel-token');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, x-et-token, x-hwid, x-admin-key, x-panel-token, x-app-version');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
@@ -709,6 +713,11 @@ function requireToken(req, res, next) {
   const token = req.headers['x-et-token'];
   const hwid  = req.headers['x-hwid'];
   if (!token) return res.status(401).json({ error: 'No token' });
+
+  // Version check — reject old builds on heartbeat too
+  const clientVersion = parseInt(req.headers['x-app-version'] || '0');
+  if (clientVersion < MIN_VERSION)
+    return res.status(426).json({ error: 'UPDATE_REQUIRED' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     const keys    = loadKeys();
@@ -733,9 +742,23 @@ function parseDuration(duration) {
 }
 
 // ── EXTENSION ROUTES ──────────────────────────────────────────────────────
+// ── VERSION CHECK — called on app launch before key gate ─────────────────
+app.get('/version-check', (req, res) => {
+  const clientVersion = parseInt(req.headers['x-app-version'] || '0');
+  if (clientVersion < MIN_VERSION)
+    return res.status(426).json({ error: 'UPDATE_REQUIRED', minVersion: MIN_VERSION });
+  res.json({ ok: true, version: clientVersion });
+});
+
 app.post('/validate', (req, res) => {
   const { key, hwid } = req.body;
   if (!key || !hwid) return res.status(400).json({ valid: false, error: 'Missing fields' });
+
+  // Version check — reject old builds
+  const clientVersion = parseInt(req.headers['x-app-version'] || '0');
+  if (clientVersion < MIN_VERSION)
+    return res.json({ valid: false, error: 'UPDATE_REQUIRED' });
+
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
   if (rateLimit(ip, 5)) return res.status(429).json({ valid: false, error: 'Too many attempts. Wait a minute.' });
   const keys  = loadKeys();
