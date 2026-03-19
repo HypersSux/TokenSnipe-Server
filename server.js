@@ -1,11 +1,10 @@
 // TokenSnipe — License Server v4
 // New commands: /pausekey, /resumekey, /activeusers, /transferkey, /addnote, /whois, /bulkrevoke
 
-const express = require('express');
-const jwt     = require('jsonwebtoken');
-const crypto  = require('crypto');
-const fs      = require('fs');
-const path    = require('path');
+const express   = require('express');
+const jwt       = require('jsonwebtoken');
+const crypto    = require('crypto');
+const { MongoClient } = require('mongodb');
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 
 const app  = express();
@@ -617,14 +616,51 @@ if (DISCORD_TOKEN && DISCORD_GUILD && DISCORD_ROLE) {
   console.log('Discord bot disabled — set DISCORD_TOKEN, DISCORD_GUILD, DISCORD_ROLE to enable');
 }
 
-// ── DATABASES ─────────────────────────────────────────────────────────────
-const KEYS_FILE  = path.join(__dirname, 'keys.json');
-const USERS_FILE = path.join(__dirname, 'users.json');
+// ── DATABASE — MongoDB (persists across Railway deploys) ──────────────────
+// Keys and users are stored in MongoDB so they never get wiped on redeploy.
+// loadKeys/saveKeys/loadUsers/saveUsers work synchronously in memory —
+// MongoDB is written to async in the background on every save.
 
-function loadKeys()  { try { return JSON.parse(fs.readFileSync(KEYS_FILE,  'utf8')); } catch { return {}; } }
-function saveKeys(k) { fs.writeFileSync(KEYS_FILE, JSON.stringify(k, null, 2)); }
-function loadUsers()  { try { return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch { return {}; } }
-function saveUsers(u) { fs.writeFileSync(USERS_FILE, JSON.stringify(u, null, 2)); }
+const MONGODB_URI = process.env.MONGODB_URI;
+if (!MONGODB_URI) { console.error('FATAL: MONGODB_URI not set'); process.exit(1); }
+
+const mongoClient = new MongoClient(MONGODB_URI);
+let db, keysCol, usersCol;
+
+// In-memory cache — loaded from MongoDB on startup
+let _keysCache  = {};
+let _usersCache = {};
+
+async function connectDB() {
+  await mongoClient.connect();
+  db       = mongoClient.db('tokensnipe');
+  keysCol  = db.collection('keys');
+  usersCol = db.collection('users');
+
+  // Load everything into memory on startup
+  const keysDoc  = await keysCol.findOne({ _id: 'keys' });
+  const usersDoc = await usersCol.findOne({ _id: 'users' });
+  _keysCache  = keysDoc  ? keysDoc.data  : {};
+  _usersCache = usersDoc ? usersDoc.data : {};
+
+  console.log(`MongoDB connected — ${Object.keys(_keysCache).length} keys, ${Object.keys(_usersCache).length} users loaded`);
+}
+
+// Synchronous in-memory reads (fast, no await needed)
+function loadKeys()  { return _keysCache; }
+function loadUsers() { return _usersCache; }
+
+// Sync update + async MongoDB write
+function saveKeys(k) {
+  _keysCache = k;
+  keysCol.replaceOne({ _id: 'keys' }, { _id: 'keys', data: k }, { upsert: true })
+    .catch(e => console.error('MongoDB saveKeys error:', e));
+}
+function saveUsers(u) {
+  _usersCache = u;
+  usersCol.replaceOne({ _id: 'users' }, { _id: 'users', data: u }, { upsert: true })
+    .catch(e => console.error('MongoDB saveUsers error:', e));
+}
 
 // ── MIDDLEWARE ────────────────────────────────────────────────────────────
 app.use(express.json());
@@ -1135,4 +1171,10 @@ setInterval(()=>{if((adminKey||panelToken)&&Object.keys(keysData).length)renderT
 </html>`);
 });
 
-app.listen(PORT, () => console.log('TokenSnipe server v4 running on port', PORT));
+// Connect to MongoDB first, then start server
+connectDB().then(() => {
+  app.listen(PORT, () => console.log('TokenSnipe server v4 running on port', PORT));
+}).catch(e => {
+  console.error('Failed to connect to MongoDB:', e);
+  process.exit(1);
+});

@@ -1,6 +1,6 @@
 {
   "name": "tokensnipe-server",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "description": "TokenSnipe license server with Discord bot",
   "main": "server.js",
   "scripts": {
@@ -10,6 +10,7 @@
   "dependencies": {
     "express": "^4.18.2",
     "jsonwebtoken": "^9.0.2",
-    "discord.js": "^14.14.1"
+    "discord.js": "^14.14.1",
+    "mongodb": "^6.3.0"
   }
 }
