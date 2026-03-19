@@ -531,15 +531,17 @@ if (DISCORD_TOKEN && DISCORD_GUILD && DISCORD_ROLE) {
 
     // ── /listkeys ────────────────────────────────────────────────────
     if (commandName === 'listkeys') {
-      const filter = interaction.options.getString('filter') || 'active';
+      const filter = interaction.options.getString('filter') || 'all';
       const keys   = loadKeys();
       const now    = new Date();
       let entries  = Object.entries(keys);
-      if (filter === 'active')  entries = entries.filter(([,v]) => v.active && !v.paused && (!v.expiresAt || new Date(v.expiresAt) > now) && v.firstActivated);
+      // 'active' includes both activated keys AND pending (not yet activated) keys
+      if (filter === 'active')  entries = entries.filter(([,v]) => v.active && !v.paused && (!v.expiresAt || new Date(v.expiresAt) > now));
       if (filter === 'revoked') entries = entries.filter(([,v]) => !v.active && !v.paused);
       if (filter === 'expired') entries = entries.filter(([,v]) => v.active && v.expiresAt && new Date(v.expiresAt) <= now);
       if (filter === 'pending') entries = entries.filter(([,v]) => v.active && !v.firstActivated && v.pendingDuration);
       if (filter === 'paused')  entries = entries.filter(([,v]) => v.paused);
+      // 'all' shows everything — no filter applied
 
       if (!entries.length) return interaction.reply({ content: `No ${filter} keys found.`, ephemeral: true });
 
