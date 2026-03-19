@@ -28,7 +28,7 @@ if (DISCORD_TOKEN && DISCORD_GUILD && DISCORD_ROLE) {
     { name: '1 hour',    value: 'h1'   }, { name: '2 hours',   value: 'h2'   },
     { name: '3 hours',   value: 'h3'   }, { name: '6 hours',   value: 'h6'   },
     { name: '12 hours',  value: 'h12'  }, { name: '18 hours',  value: 'h18'  },
-    { name: '23 hours',  value: 'h23'  }, { name: '1 day',     value: 'd1'   },
+    { name: '24 hours',  value: 'h24'  }, { name: '1 day',     value: 'd1'   },
     { name: '3 days',    value: 'd3'   }, { name: '7 days',    value: 'd7'   },
     { name: '14 days',   value: 'd14'  }, { name: '30 days',   value: 'd30'  },
     { name: '1 month',   value: 'm1'   }, { name: '2 months',  value: 'm2'   },
@@ -139,6 +139,13 @@ if (DISCORD_TOKEN && DISCORD_GUILD && DISCORD_ROLE) {
 
   client.once('clientReady', async () => {
     console.log(`Discord bot logged in as ${client.user.tag}`);
+
+    // Set bot status
+    client.user.setPresence({
+      activities: [{ name: 'TokenSnipe Keys', type: 3 }], // type 3 = Watching
+      status: 'online',
+    });
+
     try {
       const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
       await rest.put(Routes.applicationGuildCommands(client.user.id, DISCORD_GUILD), { body: commands });
